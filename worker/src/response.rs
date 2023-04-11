@@ -5,21 +5,19 @@ use crate::ByteStream;
 use crate::Result;
 use crate::WebSocket;
 
-use futures::TryStream;
-use futures::TryStreamExt;
+use futures_util::{TryStream, TryStreamExt};
 use js_sys::Uint8Array;
 use serde::{de::DeserializeOwned, Serialize};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
-use wasm_bindgen_futures::JsFuture;
 use web_sys::ReadableStream;
-use worker_sys::{response_init::ResponseInit as EdgeResponseInit, Response as EdgeResponse};
+use worker_sys::ext::{ResponseExt, ResponseInitExt};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ResponseBody {
     Empty,
     Body(Vec<u8>),
-    Stream(EdgeResponse),
+    Stream(ReadableStream),
 }
 
 const CONTENT_TYPE: &str = "content-type";
@@ -127,7 +125,7 @@ impl Response {
         let stream = wasm_streams::ReadableStream::from_stream(js_stream);
         let stream: ReadableStream = stream.into_raw().dyn_into().unwrap();
 
-        let edge_res = EdgeResponse::new_with_opt_stream(Some(&stream))?;
+        let edge_res = web_sys::Response::new_with_opt_readable_stream(Some(&stream))?;
         Ok(Self::from(edge_res))
     }
 
@@ -174,7 +172,7 @@ impl Response {
 
     /// Create a `Response` which redirects to the specified URL with default status_code of 302
     pub fn redirect(url: url::Url) -> Result<Self> {
-        match EdgeResponse::redirect(url.as_str()) {
+        match web_sys::Response::redirect(url.as_str()) {
             Ok(edge_response) => Ok(Response::from(edge_response)),
             Err(err) => Err(Error::from(err)),
         }
@@ -187,7 +185,7 @@ impl Response {
                 "redirect status codes must be in the 300-399 range! Please checkout https://developer.mozilla.org/en-US/docs/Web/HTTP/Status#redirection_messages for more".into(),
             ));
         }
-        match EdgeResponse::redirect_with_status(url.as_str(), status_code) {
+        match web_sys::Response::redirect_with_status(url.as_str(), status_code) {
             Ok(edge_response) => Ok(Response::from(edge_response)),
             Err(err) => Err(Error::from(err)),
         }
@@ -198,6 +196,11 @@ impl Response {
         self.status_code
     }
 
+    /// Access this response's body
+    pub fn body(&self) -> &ResponseBody {
+        &self.body
+    }
+
     /// Access this response's body as plaintext.
     pub async fn text(&mut self) -> Result<String> {
         match &self.body {
@@ -205,10 +208,10 @@ impl Response {
                 Ok(String::from_utf8(bytes.clone()).map_err(|e| Error::from(e.to_string()))?)
             }
             ResponseBody::Empty => Ok(String::new()),
-            ResponseBody::Stream(response) => JsFuture::from(response.text()?)
-                .await
-                .map(|value| value.as_string().unwrap())
-                .map_err(Error::from),
+            ResponseBody::Stream(_) => {
+                let bytes = self.bytes().await?;
+                String::from_utf8(bytes).map_err(|e| Error::RustError(e.to_string()))
+            }
         }
     }
 
@@ -226,25 +229,26 @@ impl Response {
         match &self.body {
             ResponseBody::Body(bytes) => Ok(bytes.clone()),
             ResponseBody::Empty => Ok(Vec::new()),
-            ResponseBody::Stream(response) => JsFuture::from(response.array_buffer()?)
-                .await
-                .map(|value| js_sys::Uint8Array::new(&value).to_vec())
-                .map_err(Error::from),
+            ResponseBody::Stream(_) => {
+                self.stream()?
+                    .try_fold(Vec::new(), |mut bytes, mut chunk| async move {
+                        bytes.append(&mut chunk);
+                        Ok(bytes)
+                    })
+                    .await
+            }
         }
     }
 
     /// Access this response's body as a [`Stream`](futures::stream::Stream) of bytes.
     pub fn stream(&mut self) -> Result<ByteStream> {
-        let edge_request = match &self.body {
-            ResponseBody::Stream(edge_request) => edge_request,
+        let stream = match &self.body {
+            ResponseBody::Stream(edge_request) => edge_request.clone(),
             _ => return Err(Error::RustError("body is not streamable".into())),
         };
 
-        let stream = edge_request
-            .body()
-            .ok_or_else(|| Error::RustError("no body for request".into()))?;
-
         let stream = wasm_streams::ReadableStream::from_raw(stream.dyn_into().unwrap());
+
         Ok(ByteStream {
             inner: stream.into_stream(),
         })
@@ -301,6 +305,25 @@ impl Response {
     pub fn headers_mut(&mut self) -> &mut Headers {
         &mut self.headers
     }
+
+    /// Clones the response so it can be used multiple times.
+    pub fn cloned(&mut self) -> Result<Self> {
+        if self.websocket.is_some() {
+            return Err(Error::RustError("WebSockets cannot be cloned".into()));
+        }
+
+        let edge = web_sys::Response::from(&*self);
+        let cloned = edge.clone()?;
+
+        // Cloning a response might modify it's body as it might need to tee the stream, so we'll
+        // need to update it.
+        self.body = match edge.body() {
+            Some(stream) => ResponseBody::Stream(stream),
+            None => ResponseBody::Empty,
+        };
+
+        Ok(cloned.into())
+    }
 }
 
 #[test]
@@ -316,9 +339,9 @@ pub struct ResponseInit {
     pub websocket: Option<WebSocket>,
 }
 
-impl From<ResponseInit> for EdgeResponseInit {
+impl From<ResponseInit> for web_sys::ResponseInit {
     fn from(init: ResponseInit) -> Self {
-        let mut edge_init = EdgeResponseInit::new();
+        let mut edge_init = web_sys::ResponseInit::new();
         edge_init.status(init.status);
         edge_init.headers(&init.headers.0);
         if let Some(websocket) = &init.websocket {
@@ -328,15 +351,14 @@ impl From<ResponseInit> for EdgeResponseInit {
     }
 }
 
-impl From<Response> for EdgeResponse {
+impl From<Response> for web_sys::Response {
     fn from(res: Response) -> Self {
         match res.body {
             ResponseBody::Body(bytes) => {
                 let array = Uint8Array::new_with_length(bytes.len() as u32);
                 array.copy_from(&bytes);
-
-                EdgeResponse::new_with_opt_u8_array_and_init(
-                    Some(array),
+                web_sys::Response::new_with_opt_buffer_source_and_init(
+                    Some(&array),
                     &ResponseInit {
                         status: res.status_code,
                         headers: res.headers,
@@ -346,17 +368,19 @@ impl From<Response> for EdgeResponse {
                 )
                 .unwrap()
             }
-            ResponseBody::Stream(response) => EdgeResponse::new_with_opt_stream_and_init(
-                response.body(),
-                &ResponseInit {
-                    status: res.status_code,
-                    headers: res.headers,
-                    websocket: res.websocket,
-                }
-                .into(),
-            )
-            .unwrap(),
-            ResponseBody::Empty => EdgeResponse::new_with_opt_str_and_init(
+            ResponseBody::Stream(stream) => {
+                web_sys::Response::new_with_opt_readable_stream_and_init(
+                    Some(&stream),
+                    &ResponseInit {
+                        status: res.status_code,
+                        headers: res.headers,
+                        websocket: res.websocket,
+                    }
+                    .into(),
+                )
+                .unwrap()
+            }
+            ResponseBody::Empty => web_sys::Response::new_with_opt_str_and_init(
                 None,
                 &ResponseInit {
                     status: res.status_code,
@@ -370,14 +394,57 @@ impl From<Response> for EdgeResponse {
     }
 }
 
-impl From<EdgeResponse> for Response {
-    fn from(res: EdgeResponse) -> Self {
+impl From<&Response> for web_sys::Response {
+    fn from(res: &Response) -> Self {
+        match &res.body {
+            ResponseBody::Body(bytes) => {
+                let array = Uint8Array::new_with_length(bytes.len() as u32);
+                array.copy_from(bytes);
+                web_sys::Response::new_with_opt_buffer_source_and_init(
+                    Some(&array),
+                    &ResponseInit {
+                        status: res.status_code,
+                        headers: res.headers.clone(),
+                        websocket: res.websocket.clone(),
+                    }
+                    .into(),
+                )
+                .unwrap()
+            }
+            ResponseBody::Stream(stream) => {
+                web_sys::Response::new_with_opt_readable_stream_and_init(
+                    Some(stream),
+                    &ResponseInit {
+                        status: res.status_code,
+                        headers: res.headers.clone(),
+                        websocket: res.websocket.clone(),
+                    }
+                    .into(),
+                )
+                .unwrap()
+            }
+            ResponseBody::Empty => web_sys::Response::new_with_opt_str_and_init(
+                None,
+                &ResponseInit {
+                    status: res.status_code,
+                    headers: res.headers.clone(),
+                    websocket: res.websocket.clone(),
+                }
+                .into(),
+            )
+            .unwrap(),
+        }
+    }
+}
+
+impl From<web_sys::Response> for Response {
+    fn from(res: web_sys::Response) -> Self {
         Self {
             headers: Headers(res.headers()),
             status_code: res.status(),
             websocket: res.websocket().map(|ws| ws.into()),
             body: match res.body() {
-                Some(_) => ResponseBody::Stream(res),
+                Some(stream) => ResponseBody::Stream(stream),
                 None => ResponseBody::Empty,
             },
         }

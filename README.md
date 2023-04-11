@@ -107,16 +107,12 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
 
 ## Getting Started
 
-Make sure you have [`wrangler`](https://github.com/cloudflare/wrangler) installed at a recent
-version (>=v1.19.2). If you want to publish your Rust worker code, you will need to have a
-[Cloudflare account](https://cloudflare.com).
+The project uses [wrangler](https://github.com/cloudflare/wrangler2) version 2.x for running and publishing your Worker.
 
-Run `wrangler --version` to check your installation and if it meets the version requirements.
-
+Get the Rust worker project [template](https://github.com/cloudflare/workers-sdk/tree/main/templates/experimental/worker-rust) manually, or run the following command:
 ```bash
-wrangler generate --type=rust project_name
+npm init cloudflare project_name worker-rust
 cd project_name
-wrangler build
 ```
 
 You should see a new project layout with a `src/lib.rs`. Start there! Use any local or remote crates
@@ -124,17 +120,25 @@ and modules (as long as they compile to the `wasm32-unknown-unknown` target).
 
 Once you're ready to run your project:
 
+First check that the wrangler version is 2.x
 ```bash
-wrangler dev
+npx wrangler --version
 ```
 
-And then go live:
+Then, run your worker
+
+```bash
+npx wrangler dev
+```
+
+Finally, go live:
 
 ```bash
 # configure your routes, zones & more in your worker's `wrangler.toml` file
-wrangler publish
+npx wrangler publish
 ```
 
+If you would like to have `wrangler` installed on your machine, see instructions in [wrangler repository](https://github.com/cloudflare/wrangler2).
 ## Durable Object, KV, Secret, & Variable Bindings
 
 All "bindings" to your script (Durable Object & KV Namespaces, Secrets, and Variables) are
@@ -236,6 +240,55 @@ new_classes = ["Chatroom"] # Array of new classes
 - For more information about migrating your Durable Object as it changes, see the docs here:
   https://developers.cloudflare.com/workers/learning/using-durable-objects#durable-object-migrations-in-wranglertoml
 
+## Queues
+
+### Enabling queues
+As queues are in beta you need to enable the `queue` feature flag.
+
+Enable it by adding it to the worker dependency in your `Cargo.toml`: 
+```toml
+worker = {version = "...", features = ["queue"]}
+```
+
+### Example worker consuming and producing messages:
+```rust
+use worker::*;
+use serde::{Deserialize, Serialize};
+#[derive(Serialize, Debug, Clone, Deserialize)]
+pub struct MyType {
+    foo: String,
+    bar: u32,
+}
+
+// Consume messages from a queue
+#[event(queue)]
+pub async fn main(message_batch: MessageBatch<MyType>, env: Env, _ctx: Context) -> Result<()> {
+    // Get a queue with the binding 'my_queue'
+    let my_queue = env.queue("my_queue")?;
+
+    // Deserialize the message batch
+    let messages = message_batch.messages()?;
+
+    // Loop through the messages
+    for message in messages {
+        // Log the message and meta data
+        console_log!(
+            "Got message {:?}, with id {} and timestamp: {}",
+            message.body,
+            message.id,
+            message.timestamp.to_string()
+        );
+
+        // Send the message body to the other queue
+        my_queue.send(&message.body).await?;
+    }
+
+    // Retry all messages
+    message_batch.retry_all();
+    Ok(())
+}
+```
+
 # Notes and FAQ
 
 It is exciting to see how much is possible with a framework like this, by expanding the options
@@ -272,7 +325,7 @@ please [take a look](https://www.cloudflare.com/careers/).
 - Most likely, it should, we just haven't had the time to fully implement it or add a library to
   wrap the FFI. Please let us know you need a feature by [opening an issue](https://github.com/cloudflare/workers-rs/issues).
 
-3. My bundle size exceeds Workers 1MB limits, what do I do?
+3. My bundle size exceeds [Workers size limits](https://developers.cloudflare.com/workers/platform/limits/), what do I do?
 
 - We're working on solutions here, but in the meantime you'll need to minimize the number of crates
   your code depends on, or strip as much from the `.wasm` binary as possible. Here are some extra
